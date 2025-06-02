@@ -13,12 +13,13 @@
 
 #include "I2Cdev.h"
 #include "MPU6050.h"
+#include <math.h>
+
+MPU6050 imu;
 
 /* MPU6050 raw data */
 int16_t ax_raw, ay_raw, az_raw;
 int16_t gx_raw, gy_raw, gz_raw;
-
-bool blinkState;
 
 /* Madgwick Filter Variables */
 #define MADGWICK_BETA_DEFAULT 0.1f // Filter gain beta
@@ -35,6 +36,10 @@ const float GYRO_SENSITIVITY = 131.0f;    // Gyro: +/- 250 dps (131 LSB/dps)
 
 //Euler Angles
 float roll, pitch, yaw;
+
+bool blinkState;
+unsigned long printCounter = 0;
+unsigned long currentTime = 0;
 
 void setup() {
   /* --Start I2C interface-- */
@@ -75,7 +80,7 @@ void setup() {
 }
 
 void loop() {
-  unsigned long currentTime = micros();
+  currentTime = micros();
   dt = (currentTime - lastUpdateTime) / 1000000.0f; // Calculate delta time in seconds
   lastUpdateTime = currentTime;
 
@@ -101,6 +106,8 @@ void loop() {
   roll = getRoll();
   pitch = getPitch();
   yaw = getYaw();
+
+  printRollPitchYaw(); // Print the movement angles
 
   /* Blink LED to indicate activity */
   blinkState = !blinkState;
@@ -191,3 +198,14 @@ void Madgwick6D(float gx, float gy, float gz, float ax, float ay, float az, floa
     q3 *= recipNorm;
 }
 
+void printRollPitchYaw() {
+  if (currentTime - printCounter > 10000) {
+    printCounter = micros();
+    Serial.print(F("roll:"));
+    Serial.print(roll, 2);
+    Serial.print(F(" pitch:"));
+    Serial.print(pitch, 2);
+    Serial.print(F(" yaw:"));
+    Serial.println(yaw, 2);
+  }
+}
