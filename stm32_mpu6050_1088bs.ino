@@ -34,6 +34,15 @@ float dt = 0.0f; // Delta time in seconds
 const float ACCEL_SENSITIVITY = 16384.0f; // Accel: +/- 2g (16384 LSB/g)
 const float GYRO_SENSITIVITY = 131.0f;    // Gyro: +/- 250 dps (131 LSB/dps)
 
+// MPU6050 Calibration Factors
+#define CALIBRATION_SAMPLES 1000
+long accel_x_sum = 0;
+long accel_y_sum = 0;
+long accel_z_sum = 0;
+long gyro_x_sum = 0;
+long gyro_y_sum = 0;
+long gyro_z_sum = 0;
+
 //Euler Angles
 float roll, pitch, yaw;
 
@@ -64,14 +73,7 @@ void setup() {
   }
 
   /* Update sensor offset values */
-  Serial.println("Updating internal sensor offsets...\n");
-  imu.setXAccelOffset(0); //Set accelerometer offset for axis X
-  imu.setYAccelOffset(0); //Set accelerometer offset for axis Y
-  imu.setZAccelOffset(0); //Set accelerometer offset for axis Z
-  imu.setXGyroOffset(0);  //Set gyro offset for axis X
-  imu.setYGyroOffset(0);  //Set gyro offset for axis Y
-  imu.setZGyroOffset(0);  //Set gyro offset for axis Z
-  Serial.println("MPU6050 configured.\n");
+  calibrateIMU();
 
   /* Configure board LED pin for output */
   pinMode(LED_BUILTIN, OUTPUT);
@@ -130,7 +132,7 @@ float getYaw() {
     return atan2(2.0f * (q0 * q3 + q1 * q2), q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3) * 180.0f / M_PI;
 }
 
-
+// Madgwick Algorithm
 void Madgwick6D(float gx, float gy, float gz, float ax, float ay, float az, float dt) {
     float recipNorm;
     float s0, s1, s2, s3;
@@ -208,4 +210,50 @@ void printRollPitchYaw() {
     Serial.print(F(" yaw:"));
     Serial.println(yaw, 2);
   }
+}
+
+void calibrateIMU() {
+  Serial.println("Starting MPU6050 calibration. Keep the sensor flat and still!");
+  delay(100);
+
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+      int16_t ax_c, ay_c, az_c, gx_c, gy_c, gz_c;
+      imu.getMotion6(&ax_c, &ay_c, &az_c, &gx_c, &gy_c, &gz_c);
+      accel_x_sum += ax_c;
+      accel_y_sum += ay_c;
+      accel_z_sum += az_c;
+      gyro_x_sum += gx_c;
+      gyro_y_sum += gy_c;
+      gyro_z_sum += gz_c;
+      delay(3); // Small delay between readings
+  }
+
+  int16_t avg_ax_raw = accel_x_sum / CALIBRATION_SAMPLES;
+  int16_t avg_ay_raw = accel_y_sum / CALIBRATION_SAMPLES;
+  int16_t avg_az_raw = accel_z_sum / CALIBRATION_SAMPLES;
+  int16_t avg_gx_raw = gyro_x_sum / CALIBRATION_SAMPLES;
+  int16_t avg_gy_raw = gyro_y_sum / CALIBRATION_SAMPLES;
+  int16_t avg_gz_raw = gyro_z_sum / CALIBRATION_SAMPLES;
+
+  Serial.print("Average Raw Accel X: "); Serial.println(avg_ax_raw);
+  Serial.print("Average Raw Accel Y: "); Serial.println(avg_ay_raw);
+  Serial.print("Average Raw Accel Z: "); Serial.println(avg_az_raw);
+  Serial.print("Average Raw Gyro X: "); Serial.println(avg_gx_raw);
+  Serial.print("Average Raw Gyro Y: "); Serial.println(avg_gy_raw);
+  Serial.print("Average Raw Gyro Z: "); Serial.println(avg_gz_raw);
+
+  // Your current Z offset calculation:
+  int16_t calculated_az_offset_for_mpu = ACCEL_SENSITIVITY - avg_az_raw;
+  // If Z is actually pointing DOWN, it should be:
+  // int16_t calculated_az_offset_for_mpu = -ACCEL_SENSITIVITY - avg_az_raw;
+
+
+  Serial.println("Setting MPU6050 offsets...");
+  imu.setXAccelOffset(-avg_ax_raw);
+  imu.setYAccelOffset(-avg_ay_raw);
+  imu.setZAccelOffset(calculated_az_offset_for_mpu);
+  imu.setXGyroOffset(-avg_gx_raw);
+  imu.setYGyroOffset(-avg_gy_raw);
+  imu.setZGyroOffset(-avg_gz_raw);
+  Serial.println("MPU6050 configured with new offsets.\n");
 }
