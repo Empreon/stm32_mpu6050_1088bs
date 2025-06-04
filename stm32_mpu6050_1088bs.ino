@@ -1,12 +1,10 @@
 #include <Wire.h> //I2c communication
 #include "src/MPU6050/MPU6050.h"
-MPU6050 mpu6050;
 
+MPU6050 mpu6050;
 
 /* User Defined Variables */
 #define USE_MPU6050_I2C
-#define GYRO_250DPS
-#define ACCEL_2G
 
 //Setup gyro and accel full scale value selection and scale factor
 #define GYRO_FS_SEL_250    MPU6050_GYRO_FS_250
@@ -29,27 +27,23 @@ float GyroErrorX = -1.11;
 float GyroErrorY = -0.65;
 float GyroErrorZ = -1.34;
 
-
 /* PINS */
 
-
 /* Global Variables*/
-
 //General stuff
 float dt;
 unsigned long current_time, prev_time;
-unsigned long print_counter, serial_counter;
-unsigned long blink_counter, blink_delay;
-bool blinkAlternate;
+unsigned long print_counter;
+unsigned long last_euler_calc_time = 0;
+const unsigned long EULER_CALC_INTERVAL_US = 10000; // 100 Hz
 
 //IMU:
 float AccX, AccY, AccZ;
 float AccX_prev, AccY_prev, AccZ_prev;
 float GyroX, GyroY, GyroZ;
 float GyroX_prev, GyroY_prev, GyroZ_prev;
-float roll_IMU, pitch_IMU, yaw_IMU;
-float roll_IMU_prev, pitch_IMU_prev;
-float q0 = 1.0f; //Initialize quaternion for madgwick filter
+float roll_IMU, pitch_IMU, yaw_IMU; // Euler angles
+float q0 = 1.0f;                    //Initialize quaternion for madgwick filter
 float q1 = 0.0f;
 float q2 = 0.0f;
 float q3 = 0.0f;
@@ -60,7 +54,7 @@ void setup() {
   delay(500);
 
   //Initialize pins
-
+  print_counter = micros();
 
   //Initialize IMU communication
   IMUinit();
@@ -68,32 +62,47 @@ void setup() {
 
   //Get IMU error to zero accelerometer and gyro readings, assuming vehicle is level when powered up
   //calculate_IMU_error(); //Calibration parameters printed to serial monitor. Paste these in the user specified variables section, then comment this out forever.
-    
-  //Set built in LED to turn on to signal startup
-  setupBlink(3, 160, 70);
 }
 
 /* LOOP */                                                  
 void loop() {
+  unsigned long t_loop_start, t_imu_start, t_imu_end, t_madgwick_end;
+
   //Keep track of what time it is and how much time has elapsed since the last loop
   prev_time = current_time;      
   current_time = micros();      
   dt = (current_time - prev_time)/1000000.0;
-  Serial.println(dt, 6);
 
-  loopBlink();  //Indicate we are in main loop with short blink every 1.5 seconds
-
+  t_loop_start = current_time; // Or micros() right at the start of real work
   //Print data at 100hz (uncomment one at a time for troubleshooting) - SELECT ONE:
   //printGyroData();      //Prints filtered gyro data direct from IMU (expected: ~ -250 to 250, 0 at rest)
   //printAccelData();     //Prints filtered accelerometer data direct from IMU (expected: ~ -2 to 2; x,y 0 when level, z 1 when level)
   //printRollPitchYaw();  //Prints roll, pitch, and yaw angles in degrees from Madgwick filter (expected: degrees, 0 when level)
 
   //Get vehicle state
+  t_imu_start = micros();
   getIMUdata(); //Pulls raw gyro, accelerometer, and magnetometer data from IMU and LP filters to remove noise
-  Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, dt); //Updates roll_IMU, pitch_IMU, and yaw_IMU angle estimates (degrees)
+  t_imu_end = micros();
+
+  bool should_calc_euler = false;
+  if (current_time - last_euler_calc_time >= EULER_CALC_INTERVAL_US) {
+    last_euler_calc_time = current_time;
+    should_calc_euler = true;
+  }
+
+  Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, dt, should_calc_euler); //Updates roll_IMU, pitch_IMU, and yaw_IMU angle estimates (degrees)
+  t_madgwick_end = micros();
+
+  if (current_time - print_counter > 1000000) { // Print every 1 second
+    print_counter = current_time;
+    Serial.print("dt (s): "); Serial.println(dt, 7);
+    Serial.print("getIMUdata us: "); Serial.println(t_imu_end - t_imu_start);
+    Serial.print("Madgwick us: "); Serial.println(t_madgwick_end - t_imu_end); // Time for Madgwick only
+    Serial.print("Total_Calc us: "); Serial.println(t_madgwick_end - t_imu_start); // Time for both
+  }
 
   //Regulate loop rate
-  loopRate(2000); //Do not exceed 2000Hz, all filter parameters tuned to 2000Hz by default
+  //loopRate(2000); //Do not exceed 2000Hz, all filter parameters tuned to 2000Hz by default
 }
 
 /* FUNCTIONS */
@@ -101,7 +110,7 @@ void loop() {
 void IMUinit() {
   //DESCRIPTION: Initialize IMU
   Wire.begin();
-  Wire.setClock(400000);
+  Wire.setClock(400000); // Max
   
   mpu6050.initialize();
   
@@ -247,12 +256,12 @@ void calibrateAttitude() {
     current_time = micros();      
     dt = (current_time - prev_time)/1000000.0; 
     getIMUdata();
-    Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, dt);
+    Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, dt, true);
     loopRate(2000); //do not exceed 2000Hz
   }
 }
 
-void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, float invSampleFreq) {
+void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, float invSampleFreq, bool calculateEuler) {
   //DESCRIPTION: Attitude estimation through sensor fusion - 6DOF
   /*
    * This function fuses the accelerometer, and gyroreadings AccX, AccY, AccZ, GyroX, GyroY, and GyroZ for attitude estimation.
@@ -332,9 +341,11 @@ void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, fl
   q3 *= recipNorm;
 
   //Compute angles
-  roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
-  pitch_IMU = -asin(constrain(-2.0f * (q1*q3 - q0*q2),-0.999999,0.999999))*57.29577951; //degrees
-  yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*57.29577951; //degrees
+  if (calculateEuler) {
+    roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*RAD_TO_DEG; //degrees
+    pitch_IMU = -asin(constrain(-2.0f * (q1*q3 - q0*q2),-0.999999f,0.999999f))*RAD_TO_DEG; //degrees
+    yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*RAD_TO_DEG; //degrees
+  }
 }
 
 void loopRate(int freq) {
@@ -354,33 +365,6 @@ void loopRate(int freq) {
     checker = micros();
   }
 }
-
-void loopBlink() {
-  //DESCRIPTION: Blink LED on board to indicate main loop is running
-  if (current_time - blink_counter > blink_delay) {
-    blink_counter = micros();
-    digitalWrite(LED_BUILTIN, blinkAlternate);
-
-    if (blinkAlternate == 1) {
-      blinkAlternate = 0;
-      blink_delay = 100000;
-    } else if (blinkAlternate == 0) {
-      blinkAlternate = 1;
-      blink_delay = 2000000;
-    }
-  }
-}
-
-void setupBlink(int numBlinks,int upTime, int downTime) {
-  //DESCRIPTION: Simple function to make LED on board blink as desired
-  for (int j = 1; j<= numBlinks; j++) {
-    digitalWrite(LED_BUILTIN, LOW);
-    delay(downTime);
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(upTime);
-  }
-}
-
 
 void printGyroData() {
   if (current_time - print_counter > 10000) {
