@@ -1,415 +1,232 @@
-#include <Wire.h> //I2c communication
-#include "src/MPU6050/MPU6050.h"
+#include <Wire.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h" // Using DMP v2.0
 
-MPU6050 mpu6050;
+MPU6050 mpu;
 
-/* User Defined Variables */
-#define USE_MPU6050_I2C
+/* User Defined Variables from original code (some may be less relevant with DMP) */
+// #define USE_MPU6050_I2C // Implied by this example
+// #define GYRO_250DPS     // DMP configures this internally or uses defaults
+// #define ACCEL_2G        // DMP configures this internally or uses defaults
 
-//Setup gyro and accel full scale value selection and scale factor
-#define GYRO_FS_SEL_250    MPU6050_GYRO_FS_250
-#define ACCEL_FS_SEL_2     MPU6050_ACCEL_FS_2
-#define GYRO_SCALE GYRO_FS_SEL_250
-#define GYRO_SCALE_FACTOR 131.0
-#define ACCEL_SCALE ACCEL_FS_SEL_2
-#define ACCEL_SCALE_FACTOR 16384.0
+// Filter parameters (DMP has its own internal filtering, and we add a timed Euler update)
+// float B_madgwick = 0.04; // Not used with DMP
+// float B_accel = 0.14;    // Not used, DMP handles/internal DLPF
+// float B_gyro = 0.1;      // Not used, DMP handles/internal DLPF
 
-//Filter parameters - Defaults tuned for 2kHz loop rate:
-float B_madgwick = 0.04;  //Madgwick filter parameter
-float B_accel = 0.14;     //Accelerometer LP filter paramter, (MPU6050 default: 0.14)
-float B_gyro = 0.1;       //Gyro LP filter paramter, (MPU6050 default: 0.1)
+// IMU calibration parameters (DMP uses its own internal calibration via mpu.CalibrateAccel/Gyro)
+// If you have PRE-CALCULATED RAW OFFSETS (not scaled like before), you can set them.
+// For now, we rely on the auto-calibration in setup.
+// int16_t rawAccelOffsetX = 0; // Example: -7000; (These are RAW sensor values)
+// int16_t rawAccelOffsetY = 0; // Example: -1200;
+// int16_t rawAccelOffsetZ = 0; // Example:  1200;
+// int16_t rawGyroOffsetX = 0;  // Example:  220;
+// int16_t rawGyroOffsetY = 0;  // Example:   76;
+// int16_t rawGyroOffsetZ = 0;  // Example:  -85;
 
-//IMU calibration parameters - calibrate IMU using calculate_IMU_error() in the void setup() to get these values, then comment out calculate_IMU_error()
-float AccErrorX = 0.12;
-float AccErrorY = 0.02;
-float AccErrorZ = 0.39;
-float GyroErrorX = -1.11;
-float GyroErrorY = -0.65;
-float GyroErrorZ = -1.34;
 
 /* PINS */
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 13 // Define LED_BUILTIN if not already defined (e.g. for ESP32)
+#endif
+// IMPORTANT: Connect MPU6050 INT pin to this Arduino Pin
+const int INTERRUPT_PIN = 2; // For Uno/Nano, this is Interrupt 0
+                              // For ESP32, you can use any GPIO, e.g., const int INTERRUPT_PIN = 15;
+
 
 /* Global Variables*/
 //General stuff
 float dt;
 unsigned long current_time, prev_time;
-unsigned long print_counter;
-unsigned long last_euler_calc_time = 0;
-const unsigned long EULER_CALC_INTERVAL_US = 10000; // 100 Hz
+unsigned long print_counter_main; // Renamed to avoid conflict if any other print_counter exists
 
-//IMU:
-float AccX, AccY, AccZ;
-float AccX_prev, AccY_prev, AccZ_prev;
-float GyroX, GyroY, GyroZ;
-float GyroX_prev, GyroY_prev, GyroZ_prev;
-float roll_IMU, pitch_IMU, yaw_IMU; // Euler angles
-float q0 = 1.0f;                    //Initialize quaternion for madgwick filter
-float q1 = 0.0f;
-float q2 = 0.0f;
-float q3 = 0.0f;
+//IMU / DMP:
+Quaternion q;        // [w, x, y, z] quaternion container from DMP
+VectorFloat gravity; // [x, y, z] gravity vector from DMP
+float ypr[3];        // [yaw, pitch, roll] Raw radians from DMP processing
+
+// Final Euler angles in degrees
+float roll_IMU, pitch_IMU, yaw_IMU;
+
+// DMP control/status
+bool dmpReady = false;    // set true if DMP init was successful
+uint8_t mpuIntStatus;     // holds actual interrupt status byte from MPU
+uint8_t devStatus;        // return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;      // expected DMP packet size (default is 42 bytes)
+uint8_t fifoBuffer[64];   // FIFO storage buffer
+
+// For less frequent Euler calculation
+unsigned long last_euler_calc_time = 0;
+const unsigned long EULER_CALC_INTERVAL_US = 10000; // 100 Hz (10000 us = 0.01s)
+
+// Interrupt flag
+volatile bool mpuInterrupt = false; // true if MPU interrupt pin has gone high
+void dmpDataReady() {
+  mpuInterrupt = true;
+}
 
 /* SETUP */
 void setup() {
-  Serial.begin(500000); //USB serial
-  delay(500);
+  Serial.begin(500000); // Your desired baud rate
+  while (!Serial && millis() < 2000); // Wait for Serial port to connect (with timeout)
 
-  //Initialize pins
-  print_counter = micros();
+  // Initialize I2C
+  #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+    Wire.begin();
+    Wire.setClock(400000); // 400kHz I2C clock. Stable for DMP.
+  #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+    Fastwire::setup(400, true);
+  #endif
 
-  //Initialize IMU communication
-  IMUinit();
-  delay(5);
+  pinMode(LED_BUILTIN, OUTPUT); // For visual feedback
 
-  //Get IMU error to zero accelerometer and gyro readings, assuming vehicle is level when powered up
-  //calculate_IMU_error(); //Calibration parameters printed to serial monitor. Paste these in the user specified variables section, then comment this out forever.
+  Serial.println(F("Initializing MPU6050..."));
+  mpu.initialize();
+  pinMode(INTERRUPT_PIN, INPUT); // Setup interrupt pin
+
+  Serial.println(F("Testing MPU6050 connection..."));
+  if (mpu.testConnection()) {
+    Serial.println(F("MPU6050 connection successful"));
+  } else {
+    Serial.println(F("MPU6050 connection failed. Halting."));
+    while (1); // Halt
+  }
+
+  Serial.println(F("Initializing DMP..."));
+  devStatus = mpu.dmpInitialize();
+
+  if (devStatus == 0) {
+    // Set any known RAW offsets BEFORE calibration if you have them
+    // Otherwise, calibration will try to find them.
+    // mpu.setXAccelOffset(rawAccelOffsetX);
+    // mpu.setYAccelOffset(rawAccelOffsetY);
+    // mpu.setZAccelOffset(rawAccelOffsetZ);
+    // mpu.setXGyroOffset(rawGyroOffsetX);
+    // mpu.setYGyroOffset(rawGyroOffsetY);
+    // mpu.setZGyroOffset(rawGyroOffsetZ);
+
+    Serial.println(F("Performing MPU6050 calibration. Keep it steady..."));
+    // These default parameters are good. For finer tuning, see library examples.
+    // Accel calibration: 6 = 1g sensitivity, Gyro calibration: 6 = 250 dps sensitivity
+    mpu.CalibrateAccel(6); 
+    mpu.CalibrateGyro(6);
+    
+    Serial.println(F("Calibration done. Active offsets:"));
+    mpu.PrintActiveOffsets(); // Display the offsets found by calibration
+
+    Serial.println(F("Enabling DMP..."));
+    mpu.setDMPEnabled(true);
+
+    Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
+    Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
+    Serial.println(F(")..."));
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+    mpuIntStatus = mpu.getIntStatus(); // Read initial interrupt status
+
+    dmpReady = true;
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.println(F("DMP ready! Waiting for first interrupt..."));
+
+    // Initialize timers
+    prev_time = micros();
+    current_time = micros();
+    print_counter_main = micros();
+    last_euler_calc_time = micros();
+
+  } else {
+    Serial.print(F("DMP Initialization failed (code "));
+    Serial.print(devStatus);
+    Serial.println(F(")"));
+    while(1); // Halt
+  }
 }
 
-/* LOOP */                                                  
+/* LOOP */
 void loop() {
-  unsigned long t_loop_start, t_imu_start, t_imu_end, t_madgwick_end;
+  if (!dmpReady) return; // If DMP failed, don't do anything
 
-  //Keep track of what time it is and how much time has elapsed since the last loop
-  prev_time = current_time;      
-  current_time = micros();      
-  dt = (current_time - prev_time)/1000000.0;
+  // Update time
+  // dt will represent time since last DMP packet processed, or last loop iteration if no packet
+  prev_time = current_time;
+  current_time = micros();
+  dt = (current_time - prev_time) / 1000000.0f;
 
-  t_loop_start = current_time; // Or micros() right at the start of real work
-  //Print data at 100hz (uncomment one at a time for troubleshooting) - SELECT ONE:
-  //printGyroData();      //Prints filtered gyro data direct from IMU (expected: ~ -250 to 250, 0 at rest)
-  //printAccelData();     //Prints filtered accelerometer data direct from IMU (expected: ~ -2 to 2; x,y 0 when level, z 1 when level)
-  //printRollPitchYaw();  //Prints roll, pitch, and yaw angles in degrees from Madgwick filter (expected: degrees, 0 when level)
+  unsigned long t_dmp_processing_start = 0, t_dmp_processing_end = 0;
+  bool new_dmp_data = false;
 
-  //Get vehicle state
-  t_imu_start = micros();
-  getIMUdata(); //Pulls raw gyro, accelerometer, and magnetometer data from IMU and LP filters to remove noise
-  t_imu_end = micros();
+  // Wait for MPU interrupt or extra packet(s) available
+  // mpu.dmpGetCurrentFIFOPacket will check the interrupt flag MPUInterrupt
+  // and also directly check fifoCount. It resets MPUInterrupt if a packet is read.
+  if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) { // Get the Latest packet from FIFO
+    new_dmp_data = true;
+    t_dmp_processing_start = micros();
 
-  bool should_calc_euler = false;
-  if (current_time - last_euler_calc_time >= EULER_CALC_INTERVAL_US) {
-    last_euler_calc_time = current_time;
-    should_calc_euler = true;
+    // Get Quaternion data from DMP FIFO
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+
+    // Calculate Euler angles only at the EULER_CALC_INTERVAL_US
+    if (current_time - last_euler_calc_time >= EULER_CALC_INTERVAL_US) {
+      last_euler_calc_time = current_time; // Reset the timer for Euler calc
+
+      mpu.dmpGetGravity(&gravity, &q);        // Calculate gravity vector from quaternion
+      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity); // Calculate Yaw, Pitch, Roll in radians
+
+      // Convert to degrees and store in our global variables
+      // The ypr array order from dmpGetYawPitchRoll is [yaw, pitch, roll]
+      yaw_IMU   = ypr[0] * 180.0f / M_PI;
+      pitch_IMU = ypr[1] * 180.0f / M_PI;
+      roll_IMU  = ypr[2] * 180.0f / M_PI;
+    }
+    t_dmp_processing_end = micros();
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Toggle LED on new data
   }
 
-  Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, dt, should_calc_euler); //Updates roll_IMU, pitch_IMU, and yaw_IMU angle estimates (degrees)
-  t_madgwick_end = micros();
 
-  if (current_time - print_counter > 1000000) { // Print every 1 second
-    print_counter = current_time;
-    Serial.print("dt (s): "); Serial.println(dt, 7);
-    Serial.print("getIMUdata us: "); Serial.println(t_imu_end - t_imu_start);
-    Serial.print("Madgwick us: "); Serial.println(t_madgwick_end - t_imu_end); // Time for Madgwick only
-    Serial.print("Total_Calc us: "); Serial.println(t_madgwick_end - t_imu_start); // Time for both
+  // Print data at 1Hz (your original style)
+  if (current_time - print_counter_main > 1000000) { // Print every 1 second
+    print_counter_main = current_time;
+    Serial.print("dt (s): "); Serial.println(dt, 7); // dt is time since last loop or DMP packet
+    if (new_dmp_data) {
+        Serial.print("DMP FIFO Read + Quat (us): "); // This is the core processing time now
+        Serial.println(t_dmp_processing_end - t_dmp_processing_start); 
+        // Note: If Euler angles were calculated in this specific DMP packet read, that time is included.
+    } else {
+        Serial.println("No new DMP data this iteration.");
+    }
+    printRollPitchYaw();
   }
 
-  //Regulate loop rate
-  //loopRate(2000); //Do not exceed 2000Hz, all filter parameters tuned to 2000Hz by default
+  // Your LED matrix control code would go here.
+  // It should use yaw_IMU, pitch_IMU, roll_IMU.
+  // Since these are updated at 100Hz (due to EULER_CALC_INTERVAL_US),
+  // your LED matrix display will also effectively update at that rate if called every loop.
+  // displayOnLedMatrices(roll_IMU, pitch_IMU, yaw_IMU); // Example call
+
+  // No explicit loopRate() function needed.
+  // The loop is effectively paced by the DMP interrupt rate for data processing
+  // and by your EULER_CALC_INTERVAL_US for Euler angle updates.
+  // If the LED matrix code is very fast, the loop will mostly idle waiting for interrupts.
 }
+
 
 /* FUNCTIONS */
 
-void IMUinit() {
-  //DESCRIPTION: Initialize IMU
-  Wire.begin();
-  Wire.setClock(400000); // Max
-  
-  mpu6050.initialize();
-  
-  if (mpu6050.testConnection() == false) {
-    Serial.println("MPU6050 initialization unsuccessful");
-    Serial.println("Check MPU6050 wiring or try cycling power");
-    while(1) {}
-  }
-
-  mpu6050.setFullScaleGyroRange(GYRO_SCALE);
-  mpu6050.setFullScaleAccelRange(ACCEL_SCALE);
-}
-
-void getIMUdata() {
-  //DESCRIPTION: Request full dataset from IMU and LP filter gyro, accelerometer, and magnetometer data
-  /*
-   * Reads accelerometer, gyro, and magnetometer data from IMU as AccX, AccY, AccZ, GyroX, GyroY, GyroZ, MagX, MagY, MagZ. 
-   * These values are scaled according to the IMU datasheet to put them into correct units of g's, deg/sec, and uT. A simple first-order
-   * low-pass filter is used to get rid of high frequency noise in these raw signals. Generally you want to cut
-   * off everything past 80Hz, but if your loop rate is not fast enough, the low pass filter will cause a lag in
-   * the readings. The filter parameters B_gyro and B_accel are set to be good for a 2kHz loop rate. Finally,
-   * the constant errors found in calculate_IMU_error() on startup are subtracted from the accelerometer and gyro readings.
-   */
-  int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,MgX,MgY,MgZ;
-
-  mpu6050.getMotion6(&AcX, &AcY, &AcZ, &GyX, &GyY, &GyZ);
-
- //Accelerometer
-  AccX = AcX / ACCEL_SCALE_FACTOR; //G's
-  AccY = AcY / ACCEL_SCALE_FACTOR;
-  AccZ = AcZ / ACCEL_SCALE_FACTOR;
-  //Correct the outputs with the calculated error values
-  AccX = AccX - AccErrorX;
-  AccY = AccY - AccErrorY;
-  AccZ = AccZ - AccErrorZ;
-  //LP filter accelerometer data
-  AccX = (1.0 - B_accel)*AccX_prev + B_accel*AccX;
-  AccY = (1.0 - B_accel)*AccY_prev + B_accel*AccY;
-  AccZ = (1.0 - B_accel)*AccZ_prev + B_accel*AccZ;
-  AccX_prev = AccX;
-  AccY_prev = AccY;
-  AccZ_prev = AccZ;
-
-  //Gyro
-  GyroX = GyX / GYRO_SCALE_FACTOR; //deg/sec
-  GyroY = GyY / GYRO_SCALE_FACTOR;
-  GyroZ = GyZ / GYRO_SCALE_FACTOR;
-  //Correct the outputs with the calculated error values
-  GyroX = GyroX - GyroErrorX;
-  GyroY = GyroY - GyroErrorY;
-  GyroZ = GyroZ - GyroErrorZ;
-  //LP filter gyro data
-  GyroX = (1.0 - B_gyro)*GyroX_prev + B_gyro*GyroX;
-  GyroY = (1.0 - B_gyro)*GyroY_prev + B_gyro*GyroY;
-  GyroZ = (1.0 - B_gyro)*GyroZ_prev + B_gyro*GyroZ;
-  GyroX_prev = GyroX;
-  GyroY_prev = GyroY;
-  GyroZ_prev = GyroZ;
-}
-
-void calculate_IMU_error() {
-  //DESCRIPTION: Computes IMU accelerometer and gyro error on startup. Note: vehicle should be powered up on flat surface
-  /*
-   * Don't worry too much about what this is doing. The error values it computes are applied to the raw gyro and 
-   * accelerometer values AccX, AccY, AccZ, GyroX, GyroY, GyroZ in getIMUdata(). This eliminates drift in the
-   * measurement. 
-   */
-  int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,MgX,MgY,MgZ;
-  AccErrorX = 0.0;
-  AccErrorY = 0.0;
-  AccErrorZ = 0.0;
-  GyroErrorX = 0.0;
-  GyroErrorY= 0.0;
-  GyroErrorZ = 0.0;
-  
-  //Read IMU values 12000 times
-  int c = 0;
-  while (c < 12000) {
-    #if defined USE_MPU6050_I2C
-      mpu6050.getMotion6(&AcX, &AcY, &AcZ, &GyX, &GyY, &GyZ);
-    #elif defined USE_MPU9250_SPI
-      mpu9250.getMotion9(&AcX, &AcY, &AcZ, &GyX, &GyY, &GyZ, &MgX, &MgY, &MgZ);
-    #endif
-    
-    AccX  = AcX / ACCEL_SCALE_FACTOR;
-    AccY  = AcY / ACCEL_SCALE_FACTOR;
-    AccZ  = AcZ / ACCEL_SCALE_FACTOR;
-    GyroX = GyX / GYRO_SCALE_FACTOR;
-    GyroY = GyY / GYRO_SCALE_FACTOR;
-    GyroZ = GyZ / GYRO_SCALE_FACTOR;
-    
-    //Sum all readings
-    AccErrorX  = AccErrorX + AccX;
-    AccErrorY  = AccErrorY + AccY;
-    AccErrorZ  = AccErrorZ + AccZ;
-    GyroErrorX = GyroErrorX + GyroX;
-    GyroErrorY = GyroErrorY + GyroY;
-    GyroErrorZ = GyroErrorZ + GyroZ;
-    c++;
-  }
-  //Divide the sum by 12000 to get the error value
-  AccErrorX  = AccErrorX / c;
-  AccErrorY  = AccErrorY / c;
-  AccErrorZ  = AccErrorZ / c - 1.0;
-  GyroErrorX = GyroErrorX / c;
-  GyroErrorY = GyroErrorY / c;
-  GyroErrorZ = GyroErrorZ / c;
-
-  Serial.print("float AccErrorX = ");
-  Serial.print(AccErrorX);
-  Serial.println(";");
-  Serial.print("float AccErrorY = ");
-  Serial.print(AccErrorY);
-  Serial.println(";");
-  Serial.print("float AccErrorZ = ");
-  Serial.print(AccErrorZ);
-  Serial.println(";");
-  
-  Serial.print("float GyroErrorX = ");
-  Serial.print(GyroErrorX);
-  Serial.println(";");
-  Serial.print("float GyroErrorY = ");
-  Serial.print(GyroErrorY);
-  Serial.println(";");
-  Serial.print("float GyroErrorZ = ");
-  Serial.print(GyroErrorZ);
-  Serial.println(";");
-
-  Serial.println("Paste these values in user specified variables section and comment out calculate_IMU_error() in void setup.");
-  while(1) {} // Halt
-}
-
-void calibrateAttitude() {
-  //DESCRIPTION: Used to warm up the main loop to allow the madwick filter to converge before commands can be sent to the actuators
-  //Assuming vehicle is powered up on level surface!
-  /*
-   * This function is used on startup to warm up the attitude estimation and is what causes startup to take a few seconds
-   * to boot. 
-   */
-  //Warm up IMU and madgwick filter in simulated main loop
-  for (int i = 0; i <= 10000; i++) {
-    prev_time = current_time;      
-    current_time = micros();      
-    dt = (current_time - prev_time)/1000000.0; 
-    getIMUdata();
-    Madgwick6DOF(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, dt, true);
-    loopRate(2000); //do not exceed 2000Hz
-  }
-}
-
-void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, float invSampleFreq, bool calculateEuler) {
-  //DESCRIPTION: Attitude estimation through sensor fusion - 6DOF
-  /*
-   * This function fuses the accelerometer, and gyroreadings AccX, AccY, AccZ, GyroX, GyroY, and GyroZ for attitude estimation.
-   * Don't worry about the math. There is a tunable parameter B_madgwick in the user specified variable section which basically
-   * adjusts the weight of gyro data in the state estimate. Higher beta leads to noisier estimate, lower 
-   * beta leads to slower to respond estimate. It is currently tuned for 2kHz loop rate. This function updates the roll_IMU,
-   * pitch_IMU, and yaw_IMU variables which are in degrees.
-   */
-  float recipNorm;
-  float s0, s1, s2, s3;
-  float qDot1, qDot2, qDot3, qDot4;
-  float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2 ,_8q1, _8q2, q0q0, q1q1, q2q2, q3q3;
-
-  //Convert gyroscope degrees/sec to radians/sec
-  gx *= 0.0174533f;
-  gy *= 0.0174533f;
-  gz *= 0.0174533f;
-
-  //Rate of change of quaternion from gyroscope
-  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
-  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
-  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
-
-  //Compute feedback only if accelerometer measurement valid (avoids NaN in accelerometer normalisation)
-  if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-    //Normalise accelerometer measurement
-    recipNorm = invSqrt(ax * ax + ay * ay + az * az);
-    ax *= recipNorm;
-    ay *= recipNorm;
-    az *= recipNorm;
-
-    //Auxiliary variables to avoid repeated arithmetic
-    _2q0 = 2.0f * q0;
-    _2q1 = 2.0f * q1;
-    _2q2 = 2.0f * q2;
-    _2q3 = 2.0f * q3;
-    _4q0 = 4.0f * q0;
-    _4q1 = 4.0f * q1;
-    _4q2 = 4.0f * q2;
-    _8q1 = 8.0f * q1;
-    _8q2 = 8.0f * q2;
-    q0q0 = q0 * q0;
-    q1q1 = q1 * q1;
-    q2q2 = q2 * q2;
-    q3q3 = q3 * q3;
-
-    //Gradient decent algorithm corrective step
-    s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
-    s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
-    s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
-    s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
-    recipNorm = invSqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3); //normalise step magnitude
-    s0 *= recipNorm;
-    s1 *= recipNorm;
-    s2 *= recipNorm;
-    s3 *= recipNorm;
-
-    //Apply feedback step
-    qDot1 -= B_madgwick * s0;
-    qDot2 -= B_madgwick * s1;
-    qDot3 -= B_madgwick * s2;
-    qDot4 -= B_madgwick * s3;
-  }
-
-  //Integrate rate of change of quaternion to yield quaternion
-  q0 += qDot1 * invSampleFreq;
-  q1 += qDot2 * invSampleFreq;
-  q2 += qDot3 * invSampleFreq;
-  q3 += qDot4 * invSampleFreq;
-
-  //Normalise quaternion
-  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  q0 *= recipNorm;
-  q1 *= recipNorm;
-  q2 *= recipNorm;
-  q3 *= recipNorm;
-
-  //Compute angles
-  if (calculateEuler) {
-    roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*RAD_TO_DEG; //degrees
-    pitch_IMU = -asin(constrain(-2.0f * (q1*q3 - q0*q2),-0.999999f,0.999999f))*RAD_TO_DEG; //degrees
-    yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*RAD_TO_DEG; //degrees
-  }
-}
-
-void loopRate(int freq) {
-  //DESCRIPTION: Regulate main loop rate to specified frequency in Hz
-  /*
-   * It's good to operate at a constant loop rate for filters to remain stable and whatnot. Interrupt routines running in the
-   * background cause the loop rate to fluctuate. This function basically just waits at the end of every loop iteration until 
-   * the correct time has passed since the start of the current loop for the desired loop rate in Hz. 2kHz is a good rate to 
-   * be at because the loop nominally will run between 2.8kHz - 4.2kHz. This lets us have a little room to add extra computations
-   * and remain above 2kHz, without needing to retune all of our filtering parameters.
-   */
-  float invFreq = 1.0/freq*1000000.0;
-  unsigned long checker = micros();
-  
-  //Sit in loop until appropriate time has passed
-  while (invFreq > (checker - current_time)) {
-    checker = micros();
-  }
-}
-
-void printGyroData() {
-  if (current_time - print_counter > 10000) {
-    print_counter = micros();
-    Serial.print(F("GyroX:"));
-    Serial.print(GyroX);
-    Serial.print(F(" GyroY:"));
-    Serial.print(GyroY);
-    Serial.print(F(" GyroZ:"));
-    Serial.println(GyroZ);
-  }
-}
-
-void printAccelData() {
-  if (current_time - print_counter > 10000) {
-    print_counter = micros();
-    Serial.print(F("AccX:"));
-    Serial.print(AccX);
-    Serial.print(F(" AccY:"));
-    Serial.print(AccY);
-    Serial.print(F(" AccZ:"));
-    Serial.println(AccZ);
-  }
-}
+// Removed IMUinit(), getIMUdata(), Madgwick6DOF(), calculate_IMU_error(), invSqrt()
+// as their functionalities are replaced or handled by the DMP library.
 
 void printRollPitchYaw() {
-  if (current_time - print_counter > 10000) {
-    print_counter = micros();
-    Serial.print(F("roll:"));
-    Serial.print(roll_IMU);
-    Serial.print(F(" pitch:"));
-    Serial.print(pitch_IMU);
-    Serial.print(F(" yaw:"));
-    Serial.println(yaw_IMU);
-  }
+  // This function now prints the latest calculated Euler angles
+  // It's called from the 1-second timed print block in loop()
+  Serial.print(F("Yaw:"));
+  Serial.print(yaw_IMU);
+  Serial.print(F(" Pitch:"));
+  Serial.print(pitch_IMU);
+  Serial.print(F(" Roll:"));
+  Serial.println(roll_IMU);
 }
 
-float invSqrt(float x) {
-  //Fast inverse sqrt for madgwick filter
-  float halfx = 0.5f * x;
-  float y = x;
-  long i = *(long*)&y;
-  i = 0x5f3759df - (i>>1);
-  y = *(float*)&i;
-  y = y * (1.5f - (halfx * y * y));
-  y = y * (1.5f - (halfx * y * y));
-  return y;
-}
+// You can add back printGyroData() and printAccelData() if you want to read
+// raw (but DMP-corrected) accel/gyro data. You'd use:
+// mpu.getAcceleration(&ax, &ay, &az);
+// mpu.getRotation(&gx, &gy, &gz);
+// And then scale them. However, the primary output now is YPR via DMP.
