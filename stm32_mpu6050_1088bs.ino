@@ -159,12 +159,23 @@ void loop() {
       mpu.dmpGetGravity(&gravity, &q);
       mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
+      float roll_deg = ypr[2] * 180.0f / M_PI;
+      float pitch_deg = ypr[1] * 180.0f / M_PI;
+
+      lc.clearDisplay(0);
+
+      byte x_bits = mapAngle2LedBit(roll_deg);
+
+      long y_index = map(pitch_deg, -90, 90, 0, 8);
+      y_index = constrain(y_index, 0, 7);
+
+      lc.setRow(0, y_index, x_bits);
+
       // Blink LED to indicate activity
       blinkState = !blinkState;
       digitalWrite(LED_BUILTIN, blinkState);
     }
   }
-
 
   /*
   // Only print the latest data at a fixed interval
@@ -185,3 +196,14 @@ void printRollPitchYaw() {
   Serial.println(ypr[2] * 180.0f / M_PI);
 }
 
+byte mapAngle2LedBit(float angle) {
+  long index = map(angle, -90, 90, 0, 8);
+  index = constrain(index, 0, 7);
+
+  // Byte values produced by shifting B10000000 (128) value to right
+  // index=0 -> 128 >> 0 -> B10000000
+  // index=1 -> 128 >> 1 -> B01000000
+  // ...
+  // index=7 -> 128 >> 7 -> B00000001
+  return (byte)(128 >> index);
+}
