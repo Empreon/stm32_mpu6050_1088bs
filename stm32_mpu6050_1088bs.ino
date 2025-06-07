@@ -1,232 +1,187 @@
-#include <Wire.h>
+/*
+  Project: MPU6050 3D Angle Visualization on LED Matrices
+  This code obtains raw data from an MPU6050 inertial measurement unit (IMU)
+  using the I2C protocol for communication with an STM32 Nucleo-L053R8 board.
+  The raw data is processed using the MPU6050's onboard Digital Motion Processor (DMP)
+  to calculate orientation angles (e.g., roll, pitch, yaw).
+
+  These angles are then visualized on two LD1088BS 8x8 LED matrices
+  (code for LED matrices to be added later),
+  driven by MAX7219 display driver ICs. Communication with the MAX7219 drivers
+  is handled via the SPI protocol from the STM32. The LED matrices aim to
+  represent the device's orientation on a conceptual 3D coordinate plane.
+*/
+
 #include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h" // Using DMP v2.0
+#include "MPU6050_6Axis_MotionApps20.h"
 
-MPU6050 mpu;
+#include <Wire.h>
+#include "LedControl.h"
 
-/* User Defined Variables from original code (some may be less relevant with DMP) */
-// #define USE_MPU6050_I2C // Implied by this example
-// #define GYRO_250DPS     // DMP configures this internally or uses defaults
-// #define ACCEL_2G        // DMP configures this internally or uses defaults
+MPU6050 mpu; // MPU6050 default I2C address is 0x68
 
-// Filter parameters (DMP has its own internal filtering, and we add a timed Euler update)
-// float B_madgwick = 0.04; // Not used with DMP
-// float B_accel = 0.14;    // Not used, DMP handles/internal DLPF
-// float B_gyro = 0.1;      // Not used, DMP handles/internal DLPF
+int const INTERRUPT_PIN = 3; // Define the MPU interrupt pin (e.g., D3)
+bool blinkState = false;     // For LED blinking
 
-// IMU calibration parameters (DMP uses its own internal calibration via mpu.CalibrateAccel/Gyro)
-// If you have PRE-CALCULATED RAW OFFSETS (not scaled like before), you can set them.
-// For now, we rely on the auto-calibration in setup.
-// int16_t rawAccelOffsetX = 0; // Example: -7000; (These are RAW sensor values)
-// int16_t rawAccelOffsetY = 0; // Example: -1200;
-// int16_t rawAccelOffsetZ = 0; // Example:  1200;
-// int16_t rawGyroOffsetX = 0;  // Example:  220;
-// int16_t rawGyroOffsetY = 0;  // Example:   76;
-// int16_t rawGyroOffsetZ = 0;  // Example:  -85;
+/*---MPU6050 Control/Status Variables---*/
+bool DMPReady = false; // Set true if DMP init was successful
+uint8_t MPUIntStatus;  // Holds actual interrupt status byte from MPU
+uint8_t devStatus; // Return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;   // Expected DMP packet size (default is 42 bytes)
+uint8_t FIFOBuffer[64]; // FIFO storage buffer
 
+/*---Orientation/Motion Variables---*/
+Quaternion q;        // [w, x, y, z]         Quaternion container
+VectorFloat gravity; // [x, y, z]            Gravity vector
+float ypr[3];        // [yaw, pitch, roll]   Yaw/Pitch/Roll container and gravity vector
 
-/* PINS */
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 13 // Define LED_BUILTIN if not already defined (e.g. for ESP32)
-#endif
-// IMPORTANT: Connect MPU6050 INT pin to this Arduino Pin
-const int INTERRUPT_PIN = 2; // For Uno/Nano, this is Interrupt 0
-                              // For ESP32, you can use any GPIO, e.g., const int INTERRUPT_PIN = 15;
+// FIX: Add variables for timed printing
+unsigned long lastPrintTime = 0;
+const unsigned int PRINT_INTERVAL = 100; // Print every 250ms
 
-
-/* Global Variables*/
-//General stuff
-float dt;
-unsigned long current_time, prev_time;
-unsigned long print_counter_main; // Renamed to avoid conflict if any other print_counter exists
-
-//IMU / DMP:
-Quaternion q;        // [w, x, y, z] quaternion container from DMP
-VectorFloat gravity; // [x, y, z] gravity vector from DMP
-float ypr[3];        // [yaw, pitch, roll] Raw radians from DMP processing
-
-// Final Euler angles in degrees
-float roll_IMU, pitch_IMU, yaw_IMU;
-
-// DMP control/status
-bool dmpReady = false;    // set true if DMP init was successful
-uint8_t mpuIntStatus;     // holds actual interrupt status byte from MPU
-uint8_t devStatus;        // return status after each device operation (0 = success, !0 = error)
-uint16_t packetSize;      // expected DMP packet size (default is 42 bytes)
-uint8_t fifoBuffer[64];   // FIFO storage buffer
-
-// For less frequent Euler calculation
-unsigned long last_euler_calc_time = 0;
-const unsigned long EULER_CALC_INTERVAL_US = 10000; // 100 Hz (10000 us = 0.01s)
-
-// Interrupt flag
-volatile bool mpuInterrupt = false; // true if MPU interrupt pin has gone high
-void dmpDataReady() {
-  mpuInterrupt = true;
+/*------Interrupt detection routine------*/
+volatile bool MPUInterrupt = false; // Indicates whether MPU6050 interrupt pin has gone high
+void DMPDataReady() {
+  MPUInterrupt = true;
 }
 
-/* SETUP */
+/*-----MAX7219 pins-----*/
+/*
+  pin 11 is connected to the DataIn
+  pin 13 is connected to the CLK
+  pin 10 is connected to LOAD
+  We have only a single MAX72XX.
+*/
+LedControl lc = LedControl(11,13,10,1);
+
 void setup() {
-  Serial.begin(500000); // Your desired baud rate
-  while (!Serial && millis() < 2000); // Wait for Serial port to connect (with timeout)
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+  Wire.begin();
+  Wire.setClock(400000); // 400kHz I2C clock.
+#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
+  Fastwire::setup(400, true);
+#endif
 
-  // Initialize I2C
-  #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-    Wire.begin();
-    Wire.setClock(400000); // 400kHz I2C clock. Stable for DMP.
-  #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
-    Fastwire::setup(400, true);
-  #endif
+  Serial.begin(115200);
+  while (!Serial); // Wait for Serial port to connect. Needed for native USB port boards only.
 
-  pinMode(LED_BUILTIN, OUTPUT); // For visual feedback
-
-  Serial.println(F("Initializing MPU6050..."));
+  /*Initialize MPU6050 device*/
+  Serial.println(F("Initializing I2C devices..."));
   mpu.initialize();
-  pinMode(INTERRUPT_PIN, INPUT); // Setup interrupt pin
+  pinMode(INTERRUPT_PIN, INPUT); // MPU interrupt pin
 
+  /*Verify connection*/
   Serial.println(F("Testing MPU6050 connection..."));
-  if (mpu.testConnection()) {
-    Serial.println(F("MPU6050 connection successful"));
+  if (mpu.testConnection() == false) {
+    Serial.println(F("MPU6050 connection failed"));
+    while (true)
+      ; // Halt on failure
   } else {
-    Serial.println(F("MPU6050 connection failed. Halting."));
-    while (1); // Halt
+    Serial.println(F("MPU6050 connection successful"));
   }
 
+  /*Wait for Serial input to proceed (optional debug step)*/
+  Serial.println(F("\nSend any character to begin DMP programming: "));
+  while (Serial.available() && Serial.read())
+    ; // Empty buffer
+  while (!Serial.available())
+    ; // Wait for data
+  while (Serial.available() && Serial.read())
+    ; // Empty buffer again
+
+  /* Initialize and configure the DMP*/
   Serial.println(F("Initializing DMP..."));
   devStatus = mpu.dmpInitialize();
 
   if (devStatus == 0) {
-    // Set any known RAW offsets BEFORE calibration if you have them
-    // Otherwise, calibration will try to find them.
-    // mpu.setXAccelOffset(rawAccelOffsetX);
-    // mpu.setYAccelOffset(rawAccelOffsetY);
-    // mpu.setZAccelOffset(rawAccelOffsetZ);
-    // mpu.setXGyroOffset(rawGyroOffsetX);
-    // mpu.setYGyroOffset(rawGyroOffsetY);
-    // mpu.setZGyroOffset(rawGyroOffsetZ);
-
-    Serial.println(F("Performing MPU6050 calibration. Keep it steady..."));
-    // These default parameters are good. For finer tuning, see library examples.
-    // Accel calibration: 6 = 1g sensitivity, Gyro calibration: 6 = 250 dps sensitivity
-    mpu.CalibrateAccel(6); 
-    mpu.CalibrateGyro(6);
-    
-    Serial.println(F("Calibration done. Active offsets:"));
-    mpu.PrintActiveOffsets(); // Display the offsets found by calibration
+    Serial.println(
+      F("Performing live calibration (ensure MPU is stationary and flat)...")
+    );
+    mpu.CalibrateAccel(6); // Calibrate accelerometer
+    mpu.CalibrateGyro(6);  // Calibrate gyroscope
+    Serial.println(F("Live calibration finished. Active offsets:"));
+    mpu.PrintActiveOffsets(); // Print the offsets
 
     Serial.println(F("Enabling DMP..."));
-    mpu.setDMPEnabled(true);
+    mpu.setDMPEnabled(true); // Turn on the DMP
 
-    Serial.print(F("Enabling interrupt detection (Arduino external interrupt "));
+    /*Enable interrupt detection*/
+    Serial.print(
+      F("Enabling interrupt detection (Arduino external interrupt ")
+    );
     Serial.print(digitalPinToInterrupt(INTERRUPT_PIN));
     Serial.println(F(")..."));
-    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
-    mpuIntStatus = mpu.getIntStatus(); // Read initial interrupt status
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), DMPDataReady, RISING);
+    MPUIntStatus = mpu.getIntStatus(); // Read initial interrupt status
 
-    dmpReady = true;
-    packetSize = mpu.dmpGetFIFOPacketSize();
     Serial.println(F("DMP ready! Waiting for first interrupt..."));
-
-    // Initialize timers
-    prev_time = micros();
-    current_time = micros();
-    print_counter_main = micros();
-    last_euler_calc_time = micros();
-
+    DMPReady = true;
+    packetSize = mpu.dmpGetFIFOPacketSize(); // Get expected DMP packet size
   } else {
     Serial.print(F("DMP Initialization failed (code "));
     Serial.print(devStatus);
     Serial.println(F(")"));
-    while(1); // Halt
   }
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  /*
+  The MAX72XX is in power-saving mode on startup,
+  we have to do a wakeup call
+  */
+  lc.shutdown(0,false);
+  // Set the brightness to a medium values and clear the display
+  lc.setIntensity(0,8);
+  lc.clearDisplay(0);
 }
 
-/* LOOP */
 void loop() {
-  if (!dmpReady) return; // If DMP failed, don't do anything
+  if (!DMPReady || !MPUInterrupt) {
+    return; // If DMP setup failed or no interrupt, do nothing
+  }
 
-  // Update time
-  // dt will represent time since last DMP packet processed, or last loop iteration if no packet
-  prev_time = current_time;
-  current_time = micros();
-  dt = (current_time - prev_time) / 1000000.0f;
+  // We have an interrupt, so let's process the FIFO
+  MPUInterrupt = false; // Reset our software interrupt flag
+  MPUIntStatus = mpu.getIntStatus();
 
-  unsigned long t_dmp_processing_start = 0, t_dmp_processing_end = 0;
-  bool new_dmp_data = false;
+  // Check for FIFO overflow
+  if (MPUIntStatus & _BV(MPU6050_INTERRUPT_FIFO_OFLOW_BIT)) {
+    mpu.resetFIFO(); // Reset the FIFO buffer if it has overflowed
+    Serial.println(F("FIFO overflow detected!"));
+    return; // Skip processing this iteration
+  }
 
-  // Wait for MPU interrupt or extra packet(s) available
-  // mpu.dmpGetCurrentFIFOPacket will check the interrupt flag MPUInterrupt
-  // and also directly check fifoCount. It resets MPUInterrupt if a packet is read.
-  if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) { // Get the Latest packet from FIFO
-    new_dmp_data = true;
-    t_dmp_processing_start = micros();
+  // Use a while loop to drain the FIFO.
+  while (mpu.getFIFOCount() >= packetSize) {
+    // Try to get a packet from FIFO.
+    if (mpu.dmpGetCurrentFIFOPacket(FIFOBuffer)) {
+      // Get Yaw, Pitch, Roll values
+      mpu.dmpGetQuaternion(&q, FIFOBuffer);
+      mpu.dmpGetGravity(&gravity, &q);
+      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-    // Get Quaternion data from DMP FIFO
-    mpu.dmpGetQuaternion(&q, fifoBuffer);
-
-    // Calculate Euler angles only at the EULER_CALC_INTERVAL_US
-    if (current_time - last_euler_calc_time >= EULER_CALC_INTERVAL_US) {
-      last_euler_calc_time = current_time; // Reset the timer for Euler calc
-
-      mpu.dmpGetGravity(&gravity, &q);        // Calculate gravity vector from quaternion
-      mpu.dmpGetYawPitchRoll(ypr, &q, &gravity); // Calculate Yaw, Pitch, Roll in radians
-
-      // Convert to degrees and store in our global variables
-      // The ypr array order from dmpGetYawPitchRoll is [yaw, pitch, roll]
-      yaw_IMU   = ypr[0] * 180.0f / M_PI;
-      pitch_IMU = ypr[1] * 180.0f / M_PI;
-      roll_IMU  = ypr[2] * 180.0f / M_PI;
+      // Blink LED to indicate activity
+      blinkState = !blinkState;
+      digitalWrite(LED_BUILTIN, blinkState);
     }
-    t_dmp_processing_end = micros();
-    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN)); // Toggle LED on new data
   }
 
 
-  // Print data at 1Hz (your original style)
-  if (current_time - print_counter_main > 1000000) { // Print every 1 second
-    print_counter_main = current_time;
-    Serial.print("dt (s): "); Serial.println(dt, 7); // dt is time since last loop or DMP packet
-    if (new_dmp_data) {
-        Serial.print("DMP FIFO Read + Quat (us): "); // This is the core processing time now
-        Serial.println(t_dmp_processing_end - t_dmp_processing_start); 
-        // Note: If Euler angles were calculated in this specific DMP packet read, that time is included.
-    } else {
-        Serial.println("No new DMP data this iteration.");
-    }
+  /*
+  // Only print the latest data at a fixed interval
+  unsigned long currentTime = millis();
+  if (currentTime - lastPrintTime > PRINT_INTERVAL) {
+    lastPrintTime = currentTime; // Update the last print time
     printRollPitchYaw();
   }
-
-  // Your LED matrix control code would go here.
-  // It should use yaw_IMU, pitch_IMU, roll_IMU.
-  // Since these are updated at 100Hz (due to EULER_CALC_INTERVAL_US),
-  // your LED matrix display will also effectively update at that rate if called every loop.
-  // displayOnLedMatrices(roll_IMU, pitch_IMU, yaw_IMU); // Example call
-
-  // No explicit loopRate() function needed.
-  // The loop is effectively paced by the DMP interrupt rate for data processing
-  // and by your EULER_CALC_INTERVAL_US for Euler angle updates.
-  // If the LED matrix code is very fast, the loop will mostly idle waiting for interrupts.
+  */
 }
-
-
-/* FUNCTIONS */
-
-// Removed IMUinit(), getIMUdata(), Madgwick6DOF(), calculate_IMU_error(), invSqrt()
-// as their functionalities are replaced or handled by the DMP library.
 
 void printRollPitchYaw() {
-  // This function now prints the latest calculated Euler angles
-  // It's called from the 1-second timed print block in loop()
-  Serial.print(F("Yaw:"));
-  Serial.print(yaw_IMU);
-  Serial.print(F(" Pitch:"));
-  Serial.print(pitch_IMU);
-  Serial.print(F(" Roll:"));
-  Serial.println(roll_IMU);
+  Serial.print("Yaw: ");
+  Serial.print(ypr[0] * 180.0f / M_PI);
+  Serial.print("\t Pitch: ");
+  Serial.print(ypr[1] * 180.0f / M_PI);
+  Serial.print("\t Roll: ");
+  Serial.println(ypr[2] * 180.0f / M_PI);
 }
 
-// You can add back printGyroData() and printAccelData() if you want to read
-// raw (but DMP-corrected) accel/gyro data. You'd use:
-// mpu.getAcceleration(&ax, &ay, &az);
-// mpu.getRotation(&gx, &gy, &gz);
-// And then scale them. However, the primary output now is YPR via DMP.
