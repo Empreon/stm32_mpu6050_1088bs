@@ -28,9 +28,10 @@
 #define LED_MATRIX_MIN 0
 #define LED_MATRIX_MAX 7
 
+#define INTERRUPT_PIN 3 // Define the MPU interrupt pin (D3)
+
 MPU6050 mpu; // MPU6050 default I2C address is 0x68
 
-int const INTERRUPT_PIN = 3; // Define the MPU interrupt pin (D3)
 bool blinkState = false;     // For LED blinking
 
 /*---MPU6050 Control/Status Variables---*/
@@ -125,7 +126,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
 
   /*
-  The MAX72XX is in power-saving mode on startup,
+  The MAX7219 is in power-saving mode on startup,
   we have to do a wakeup call
   */
   lc.shutdown(0,false);
