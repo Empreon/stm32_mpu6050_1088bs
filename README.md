@@ -1,100 +1,139 @@
-3D Angle Visualization with MPU6050 and LED Matrices
+# 3D Angle Visualization with MPU6050 and LED Matrices
 
-This project captures real-time 3D orientation data (yaw, pitch, and roll) from an MPU6050 Inertial Measurement Unit (IMU) and visualizes it on a pair of 8x8 LED matrices. The system is controlled by an STM32 Nucleo-L053R8 microcontroller and leverages the MPU6050's onboard Digital Motion Processor (DMP) for efficient, high-performance angle calculations.
+A course project for EE 2004 – Microprocessor Systems at Marmara University. This project captures real-time 3D orientation data from an MPU6050 IMU and visualizes the roll, pitch, and yaw angles on a pair of 8x8 LED matrices, controlled by an STM32 Nucleo-L053R8 microcontroller.
 
-Features
+## Table of Contents
 
-Real-time Orientation Tracking: Accurately tracks yaw, pitch, and roll angles.
+- [Project Overview](#project-overview)
+- [Features](#features)
+- [Hardware](#hardware)
+  - [Components](#components)
+  - [Wiring](#wiring)
+- [Software & Libraries](#software--libraries)
+- [How It Works](#how-it-works)
+  - [Data Acquisition with DMP](#data-acquisition-with-dmp)
+  - [Interrupt-Driven Architecture](#interrupt-driven-architecture)
+  - [Display Logic](#display-logic)
+- [Setup and Installation](#setup-and-installation)
+- [Code Structure](#code-structure)
+- [Development Challenge & Solution](#development-challenge--solution)
+- [Authors](#authors)
 
-Efficient DMP Processing: Offloads complex sensor fusion algorithms from the microcontroller to the MPU6050's DMP, ensuring high responsiveness and stability.
+## Project Overview
 
-Interrupt-Driven Architecture: A non-blocking main loop processes data only when signaled by an interrupt from the MPU6050, minimizing CPU load and preventing data loss (FIFO overflow).
+The goal of this project is to process sensor data from an MPU6050 to calculate Euler angles (yaw, pitch, and roll) and display them dynamically. The visualization is achieved using two 8x8 LED matrices arranged perpendicularly to represent a 3D coordinate space:
 
-3D Coordinate Visualization: Two 8x8 LED matrices are arranged to represent a 3D space:
+- **Matrix 1 (Roll vs. Pitch):** The horizontal axis represents the roll angle (x-axis), and the vertical axis represents the pitch angle (y-axis).
+- **Matrix 2 (Yaw vs. Pitch):** The horizontal axis represents the yaw angle (z-axis), and the vertical axis again represents the pitch angle (y-axis).
 
-Matrix 0: Displays Roll (X-axis) vs. Pitch (Y-axis).
+To ensure high performance and accuracy, the project leverages the MPU6050's integrated **Digital Motion Processor (DMP)**, which offloads the complex sensor fusion algorithms from the STM32 microcontroller.
 
-Matrix 1: Displays Yaw (Z-axis) vs. Pitch (Y-axis).
+## Features
 
-Arduino IDE Compatible: The firmware is developed in the Arduino environment for ease of use and portability.
+- Real-time 3D orientation tracking (Roll, Pitch, Yaw).
+- Visualizes angles on two perpendicular 8x8 LED matrices.
+- Utilizes the MPU6050's onboard Digital Motion Processor (DMP) for efficient, high-performance angle calculation.
+- Employs an interrupt-driven, non-blocking architecture for a highly responsive system.
+- Built on the STM32 Nucleo-L053R8 platform and developed in the Arduino IDE.
 
-Hardware Requirements
+## Hardware
 
-STM32 Nucleo-L053R8 (or a compatible STM32 board)
+### Components
 
-MPU6050 IMU Sensor Module
+| Component              | Description                                      |
+| ---------------------- | ------------------------------------------------ |
+| STM32 Nucleo-L053R8    | Microcontroller board                            |
+| MPU6050                | Inertial Measurement Unit (Accelerometer + Gyro) |
+| 2x 8x8 LED Matrix      | Display modules                                  |
+| 2x MAX7219             | LED matrix driver ICs                            |
+| Breadboard & Wires     | For connections                                  |
 
-2 x MAX7219 8x8 Dot Matrix LED Display Modules
+### Wiring
 
-Breadboard and Jumper Wires
+The components are connected using I2C for the sensor and SPI for the displays.
 
-Software & Libraries
+**MPU6050 (I2C Connection)**
 
-Arduino IDE
+| MPU6050 Pin | STM32 Pin | Description        |
+| ----------- | --------- | ------------------ |
+| VCC         | 5V        | Power              |
+| GND         | GND       | Ground             |
+| SCL         | D15 (SCL) | I2C Clock          |
+| SDA         | D14 (SDA) | I2C Data           |
+| INT         | D3        | Interrupt Signal   |
 
-STM32 Core for Arduino
+**MAX7219 LED Matrices (SPI Daisy-Chained)**
 
-i2cdevlib by Jeff Rowberg (specifically the I2Cdev and MPU6050_6Axis_MotionApps20 libraries)
+The two MAX7219 drivers are daisy-chained. The `DOUT` of the first driver is connected to the `DIN` of the second driver.
 
-LedControl by Eberhard Fahle
+| MAX7219 (First Driver) Pin | STM32 Pin | Description        |
+| -------------------------- | --------- | ------------------ |
+| VCC                        | 5V        | Power              |
+| GND                        | GND       | Ground             |
+| DIN                        | D11 (MOSI)| SPI Data In        |
+| CS (LOAD)                  | D10 (SS)  | SPI Chip Select    |
+| CLK                        | D13 (SCK) | SPI Clock          |
 
-Wiring and Connections
+## Software & Libraries
 
-Connect the components as described in the tables below.
+The firmware is developed using the **Arduino IDE** with the STM32Duino core. The following libraries are required:
 
-MPU6050 (I2C)
-MPU6050 Pin	STM32 Nucleo Pin	Description
-VCC	3.3V	Power
-GND	GND	Ground
-SCL	D15 (SCL)	I2C Clock
-SDA	D14 (SDA)	I2C Data
-INT	D3	Interrupt Signal
-MAX7219 LED Matrices (SPI - Daisy Chained)
+- **`Wire.h`**: Standard library for I2C communication.
+- **`I2Cdev.h`** and **`MPU6050_6Axis_MotionApps20.h`**: From Jeff Rowberg's i2cdevlib, for interfacing with the MPU6050 and its DMP.
+- **`LedControl.h`**: For controlling the MAX7219 display drivers.
 
-The two MAX7219 modules are daisy-chained. The DOUT of the first matrix connects to the DIN of the second.
+## How It Works
 
-MAX7219 Pin	STM32 Nucleo Pin	Description
-VCC	5V	Power
-GND	GND	Ground
-DIN	D11 (MOSI)	SPI Data In (to Matrix 1)
-CS / LOAD	D10	SPI Chip Select
-CLK	D13 (SCK)	SPI Clock
-How It Works
+### Data Acquisition with DMP
 
-Initialization: The setup() function initializes serial communication, the I2C bus, the MPU6050 sensor, and the MAX7219 display drivers.
+Instead of running a sensor fusion algorithm like the Madgwick filter on the STM32, this project offloads the task to the MPU6050's onboard Digital Motion Processor (DMP). The DMP continuously processes raw accelerometer and gyroscope data, performs sensor fusion, and places the resulting orientation data (in the form of quaternions) into a FIFO buffer, ready for the microcontroller to read.
 
-DMP Firmware: It then loads the Digital Motion Processor firmware onto the MPU6050. This allows the sensor itself to perform the complex sensor fusion calculations, converting raw accelerometer and gyroscope data into stable quaternion values.
+### Interrupt-Driven Architecture
 
-Calibration: A live calibration of the accelerometer and gyroscope is performed to ensure accuracy.
+The system is designed to be highly efficient and non-blocking.
+1. The MPU6050's `INT` pin is connected to an interrupt-capable pin on the STM32.
+2. When the DMP has a new data packet ready in the FIFO buffer, it generates a RISING edge signal on the `INT` pin.
+3. This signal triggers an Interrupt Service Routine (ISR), `DMPDataReady()`, on the STM32.
+4. The ISR's only job is to set a boolean flag, `MPUInterrupt = true;`.
+5. The main `loop()` function constantly checks this flag. If it's `false`, the CPU does nothing, saving cycles. If it's `true`, it proceeds to read the data from the MPU.
 
-Interrupt-Driven Data Acquisition: The MPU6050 is configured to issue a hardware interrupt on its INT pin whenever a new packet of orientation data is available in its FIFO (First-In, First-Out) buffer. The STM32 listens for this interrupt.
+### Display Logic
 
-Non-Blocking Loop: The main loop() does nothing until the interrupt flag is set. This is highly efficient.
+1. When new data is available, the main loop retrieves the data packet from the MPU's FIFO buffer.
+2. It uses the library functions to convert the quaternion data into Euler angles (yaw, pitch, roll) in degrees.
+3. The pitch angle is mapped from a range of `[-90, 90]` to a row index `[0, 7]` for the LED matrices.
+4. The roll and yaw angles are similarly mapped to a column index `[0, 7]`. This index is then converted into a byte where only one bit is set (e.g., index 2 becomes `B00100000`) using the `mapAngle2LedBit()` helper function.
+5. The displays are cleared, and `lc.setRow()` is used to light up the single LED on each matrix that corresponds to the current orientation.
 
-Data Processing: Once an interrupt is detected, the STM32 reads the data packet from the MPU's FIFO buffer. It extracts the quaternion and calculates the final yaw, pitch, and roll angles in degrees.
+## Setup and Installation
 
-Visualization: The yaw, pitch, and roll angles (ranging from -90 to +90 degrees) are mapped to the 8x8 grid of the LED matrices. A single LED is lit on each matrix to represent the device's current orientation in the conceptual 3D space.
+1.  **Hardware Assembly**: Connect the components as described in the [Wiring](#wiring) section. Ensure the MAX7219 drivers are correctly daisy-chained.
+2.  **Software Setup**:
+    - Install the [Arduino IDE](https://www.arduino.cc/en/software).
+    - Install the [STM32Duino core](https://github.com/stm32duino/Arduino_Core_STM32) via the Board Manager.
+    - Install the required libraries using the Arduino Library Manager:
+      - `LedControl` by Eberhard Fahle
+      - `MPU6050` by Jeff Rowberg (this will also install `I2Cdev`)
+3.  **Upload Code**:
+    - Open the `stm32_mpu6050_1088bs.ino` file in the Arduino IDE.
+    - Select your STM32 Nucleo board from the `Tools > Board` menu.
+    - Select the correct COM port.
+    - Upload the sketch to the board.
 
-Installation and Usage
+## Code Structure
 
-Hardware: Assemble the circuit according to the Wiring and Connections section.
+- **`setup()`**: Initializes Serial communication (for debugging), I2C, the MPU6050, and the DMP. It performs an initial calibration and enables the DMP interrupt. It also initializes the two MAX7219 drivers.
+- **`loop()`**: The main non-blocking loop. It waits for the `MPUInterrupt` flag to be set, checks for FIFO overflow, reads the data packet, processes it into yaw, pitch, and roll, and updates the two LED matrices.
+- **`DMPDataReady()`**: The Interrupt Service Routine (ISR) that sets the `MPUInterrupt` flag when new data is available from the sensor.
+- **`mapAngle2LedBit()`**: A helper function to map an angle to a single bit in a byte, used for setting the correct column LED.
 
-IDE Setup: Install the Arduino IDE and add support for STM32 boards using the Boards Manager.
+## Development Challenge & Solution
 
-Install Libraries: Install the i2cdevlib and LedControl libraries. You can do this via the Arduino Library Manager or by downloading the repositories and adding them to your libraries folder.
+A key challenge was performance. An initial attempt using a software-based Madgwick sensor fusion filter on the STM32 was too computationally intensive, resulting in a low update frequency (400-500 Hz) and inaccurate angle calculations. This also led to frequent FIFO buffer overflows on the MPU6050, as the STM32 could not read the data fast enough.
 
-Upload Code: Open the stm32_mpu6050_1088bs.ino file in the Arduino IDE. Select your STM32 board and the correct COM port.
+The decisive solution was to switch to the **MPU6050's onboard DMP**. By offloading the complex fusion calculations to the sensor itself, the STM32 was freed to focus solely on data retrieval and display updates. This architectural change, combined with the interrupt-driven approach, resolved the performance bottleneck and eliminated the FIFO overflow issue, resulting in a highly responsive and stable system.
 
-Run: Upload the code. Open the Serial Monitor at 115200 baud. You will be prompted to send any character to begin the DMP calibration and start the program.
+## Authors
 
-Visualize: Tilt the MPU6050 sensor and observe the corresponding LEDs light up on the two matrices.
-
-Authors
-
-Ahmet Utku YILMAZ
-
-Feyzullah OĞUZ
-
-License
-
-This project is licensed under the MIT License - see the LICENSE.md file for details.
+- **Ahmet Utku YILMAZ** ([150723841](mailto:150723841@marun.edu.tr))
+- **Feyzullah OĞUZ** ([150720035](mailto:150720035@marun.edu.tr))
