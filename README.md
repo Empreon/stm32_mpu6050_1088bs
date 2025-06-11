@@ -132,8 +132,3 @@ The system is designed to be highly efficient and non-blocking.
 A key challenge was performance. An initial attempt using a software-based Madgwick sensor fusion filter on the STM32 was too computationally intensive, resulting in a low update frequency (400-500 Hz) and inaccurate angle calculations. This also led to frequent FIFO buffer overflows on the MPU6050, as the STM32 could not read the data fast enough.
 
 The decisive solution was to switch to the **MPU6050's onboard DMP**. By offloading the complex fusion calculations to the sensor itself, the STM32 was freed to focus solely on data retrieval and display updates. This architectural change, combined with the interrupt-driven approach, resolved the performance bottleneck and eliminated the FIFO overflow issue, resulting in a highly responsive and stable system.
-
-## Authors
-
-- **Ahmet Utku YILMAZ** ([150723841](mailto:150723841@marun.edu.tr))
-- **Feyzullah OĞUZ** ([150720035](mailto:150720035@marun.edu.tr))
