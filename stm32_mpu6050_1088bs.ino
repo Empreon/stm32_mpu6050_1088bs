@@ -5,7 +5,7 @@
   The raw data is processed using the MPU6050's onboard Digital Motion Processor (DMP)
   to calculate orientation angles (e.g., roll, pitch, yaw).
 
-  These angles are then visualized on two LD1088BS 8x8 LED matrices,
+  These angles are then visualized on two LD1088AS 8x8 LED matrices,
   driven by MAX7219 display driver ICs. Communication with the MAX7219 drivers
   is handled via the SPI protocol from the STM32. The LED matrices aim to
   represent the device's orientation on a conceptual 3D coordinate plane.
